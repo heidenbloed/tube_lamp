@@ -1,13 +1,16 @@
 #[macro_use]
 extern crate dotenv_codegen;
 
+use core::pin::pin;
 use core::time::Duration;
 
+use embassy_futures::select::{select, Either};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::mqtt::client::*;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::EspError;
+use esp_idf_svc::timer::{EspAsyncTimer, EspTaskTimerService, EspTimerService};
 use esp_idf_svc::wifi::*;
 use log::*;
 
@@ -24,76 +27,92 @@ fn main() {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let sys_loop = EspSystemEventLoop::take().unwrap();
+    let timer_service = EspTimerService::new().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
-    let _wifi = wifi_create(&sys_loop, &nvs).unwrap();
+    esp_idf_svc::hal::task::block_on(async {
+        let _wifi = wifi_create(&sys_loop, &timer_service, &nvs).await?;
+        info!("Wifi created");
 
-    let (mut client, mut conn) =
-        mqtt_create(MQTT_URL, MQTT_USERNAME, MQTT_PASSWORD, MQTT_CLIENT_ID).unwrap();
+        let (mut client, mut conn) =
+            mqtt_create(MQTT_URL, MQTT_USERNAME, MQTT_PASSWORD, MQTT_CLIENT_ID).unwrap();
 
-    run(&mut client, &mut conn, MQTT_TOPIC).unwrap();
+        let mut timer = timer_service.timer_async()?;
+        run(&mut client, &mut conn, &mut timer, MQTT_TOPIC).await
+    })
+    .unwrap();
 }
 
-fn run(
-    client: &mut EspMqttClient<'_>,
-    connection: &mut EspMqttConnection,
+async fn run(
+    client: &mut EspAsyncMqttClient,
+    connection: &mut EspAsyncMqttConnection,
+    timer: &mut EspAsyncTimer,
     topic: &str,
 ) -> Result<(), EspError> {
-    std::thread::scope(|s| {
-        info!("About to start the MQTT client");
+    info!("About to start the MQTT client");
 
-        // Need to immediately start pumping the connection for messages, or else
-        // subscribe() and publish() below will not work Note that when using
+    let res = select(
+        // Need to immediately start pumping the connection for messages, or else subscribe() and
+        // publish() below will not work Note that when using the alternative structure and
         // the alternative constructor - `EspMqttClient::new_cb` - you don't need to
-        // spawn a new thread, as the messages will be pumped with a backpressure into
-        // the callback you provide. Yet, you still need to efficiently process
-        // each message in the callback without blocking for too long.
+        // spawn a new thread, as the messages will be pumped with a backpressure into the callback
+        // you provide. Yet, you still need to efficiently process each message in the
+        // callback without blocking for too long.
         //
         // Note also that if you go to http://tools.emqx.io/ and then connect and send a message to topic
         // "esp-mqtt-demo", the client configured here should receive it.
-        std::thread::Builder::new()
-            .stack_size(6000)
-            .spawn_scoped(s, move || {
-                info!("MQTT Listening for messages");
+        pin!(async move {
+            info!("MQTT Listening for messages");
 
-                while let Ok(event) = connection.next() {
-                    info!("[Queue] Event: {}", event.payload());
+            while let Ok(event) = connection.next().await {
+                info!("[Queue] Event: {}", event.payload());
+            }
+
+            info!("Connection closed");
+
+            Ok(())
+        }),
+        pin!(async move {
+            // Using `pin!` is optional, but it optimizes the memory size of the Futures
+            loop {
+                if let Err(e) = client.subscribe(topic, QoS::AtMostOnce).await {
+                    error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
+
+                    // Re-try in 0.5s
+                    timer.after(Duration::from_millis(500)).await?;
+
+                    continue;
                 }
 
-                info!("Connection closed");
-            })
-            .unwrap();
+                info!("Subscribed to topic \"{topic}\"");
 
-        loop {
-            if let Err(e) = client.subscribe(topic, QoS::AtMostOnce) {
-                error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
+                // Just to give a chance of our connection to get even the first published
+                // message
+                timer.after(Duration::from_millis(500)).await?;
 
-                // Re-try in 0.5s
-                std::thread::sleep(Duration::from_millis(500));
+                let payload = "Hello from esp-mqtt-demo!";
 
-                continue;
+                loop {
+                    client
+                        .publish(topic, QoS::AtMostOnce, false, payload.as_bytes())
+                        .await?;
+
+                    info!("Published \"{payload}\" to topic \"{topic}\"");
+
+                    let sleep_secs = 2;
+
+                    info!("Now sleeping for {sleep_secs}s...");
+                    timer.after(Duration::from_secs(sleep_secs)).await?;
+                }
             }
+        }),
+    )
+    .await;
 
-            info!("Subscribed to topic \"{topic}\"");
-
-            // Just to give a chance of our connection to get even the first published
-            // message
-            std::thread::sleep(Duration::from_millis(500));
-
-            let payload = "Hello from esp-mqtt-demo!";
-
-            loop {
-                client.enqueue(topic, QoS::AtMostOnce, false, payload.as_bytes())?;
-
-                info!("Published \"{payload}\" to topic \"{topic}\"");
-
-                let sleep_secs = 2;
-
-                info!("Now sleeping for {sleep_secs}s...");
-                std::thread::sleep(Duration::from_secs(sleep_secs));
-            }
-        }
-    })
+    match res {
+        Either::First(res) => res,
+        Either::Second(res) => res,
+    }
 }
 
 fn mqtt_create(
@@ -101,8 +120,8 @@ fn mqtt_create(
     username: &str,
     password: &str,
     client_id: &str,
-) -> Result<(EspMqttClient<'static>, EspMqttConnection), EspError> {
-    let (mqtt_client, mqtt_conn) = EspMqttClient::new(
+) -> Result<(EspAsyncMqttClient, EspAsyncMqttConnection), EspError> {
+    let (mqtt_client, mqtt_conn) = EspAsyncMqttClient::new(
         url,
         &MqttClientConfiguration {
             client_id: Some(client_id),
@@ -115,14 +134,15 @@ fn mqtt_create(
     Ok((mqtt_client, mqtt_conn))
 }
 
-fn wifi_create(
+async fn wifi_create(
     sys_loop: &EspSystemEventLoop,
+    timer_service: &EspTaskTimerService,
     nvs: &EspDefaultNvsPartition,
 ) -> Result<EspWifi<'static>, EspError> {
     let peripherals = Peripherals::take()?;
 
     let mut esp_wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?;
-    let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sys_loop.clone())?;
+    let mut wifi = AsyncWifi::wrap(&mut esp_wifi, sys_loop.clone(), timer_service.clone())?;
 
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
         ssid: SSID.try_into().unwrap(),
@@ -130,13 +150,13 @@ fn wifi_create(
         ..Default::default()
     }))?;
 
-    wifi.start()?;
+    wifi.start().await?;
     info!("Wifi started");
 
-    wifi.connect()?;
+    wifi.connect().await?;
     info!("Wifi connected");
 
-    wifi.wait_netif_up()?;
+    wifi.wait_netif_up().await?;
     info!("Wifi netif up");
 
     Ok(esp_wifi)

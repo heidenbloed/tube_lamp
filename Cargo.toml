@@ -22,6 +22,7 @@ experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
 dotenv_codegen = "0.15.0"
+embassy-futures = "0.1.1"
 log = "0.4"
 [dependencies.esp-idf-svc]
 features = ["critical-section", "embassy-sync", "embassy-time-driver"]
