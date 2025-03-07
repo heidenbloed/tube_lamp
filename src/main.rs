@@ -14,7 +14,6 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::EspError;
 use esp_idf_svc::timer::{EspAsyncTimer, EspTaskTimerService, EspTimerService};
 use esp_idf_svc::wifi::*;
-use esp_idf_sys::esp_random;
 use log::*;
 use smart_leds::hsv::{hsv2rgb, Hsv};
 use smart_leds_trait::SmartLedsWrite;
@@ -34,7 +33,6 @@ const MQTT_TOPIC_HEX: &str = "lamps/tube/hex";
 const MQTT_TOPIC_WARM: &str = "lamps/tube/warm";
 const MQTT_TOPIC_PROGRESS: &str = "lamps/tube/progress";
 const MQTT_TOPIC_WHEEL_SPEED: &str = "lamps/tube/wheel_speed";
-const MQTT_TOPIC_LOG: &str = "lamps/tube/log";
 
 const NUM_LEDS: usize = 5;
 
@@ -122,7 +120,18 @@ async fn run_mqtt_and_led_loop(
     }
 }
 
-fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Sender<&str>) {
+#[derive(Debug)]
+enum Command {
+    Mode,
+    Rgb,
+    Hsv(u8, u8, u8),
+    Hex,
+    Warm,
+    Progress,
+    Wheel,
+}
+
+fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Sender<Command>) {
     match event_payload {
         EventPayload::Received {
             id,
@@ -136,37 +145,54 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                     Some(MQTT_TOPIC_MODE) => {
                         info!("Received mode change message.");
                         warn!("Not yet implemented.");
-                        tx.send("mode").unwrap();
+                        tx.send(Command::Mode).unwrap();
                     }
                     Some(MQTT_TOPIC_RGB) => {
                         info!("Received color change (RGB) message.");
                         warn!("Not yet implemented.");
-                        tx.send("rgb").unwrap();
+                        tx.send(Command::Rgb).unwrap();
                     }
                     Some(MQTT_TOPIC_HSV) => {
                         info!("Received color change (HSV) message.");
-                        warn!("Not yet implemented.");
-                        tx.send("hsv").unwrap();
+                        let mut msg_conv_successful = false;
+                        let msg_split: Vec<_> =
+                            msg.split(",").take(3).map(|s| s.parse::<u8>()).collect();
+                        if msg_split.len() == 3 {
+                            if let Ok(hue) = msg_split[0] {
+                                if let Ok(sat) = msg_split[1] {
+                                    if let Ok(val) = msg_split[2] {
+                                        info!(
+                                            "Parsed HSV values: hue={hue}, sat={sat}, val={val}."
+                                        );
+                                        tx.send(Command::Hsv(hue, sat, val)).unwrap();
+                                        msg_conv_successful = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !msg_conv_successful {
+                            warn!("Could not parse HSV values.");
+                        }
                     }
                     Some(MQTT_TOPIC_HEX) => {
                         info!("Received color change (HEX) message.");
                         warn!("Not yet implemented.");
-                        tx.send("hex").unwrap();
+                        tx.send(Command::Hex).unwrap();
                     }
                     Some(MQTT_TOPIC_WARM) => {
                         info!("Received color change (warm) message.");
                         warn!("Not yet implemented.");
-                        tx.send("warm").unwrap();
+                        tx.send(Command::Warm).unwrap();
                     }
                     Some(MQTT_TOPIC_PROGRESS) => {
                         info!("Received progress change message.");
                         warn!("Not yet implemented.");
-                        tx.send("progress").unwrap();
+                        tx.send(Command::Progress).unwrap();
                     }
                     Some(MQTT_TOPIC_WHEEL_SPEED) => {
                         info!("Received wheel change message.");
                         warn!("Not yet implemented.");
-                        tx.send("wheel").unwrap();
+                        tx.send(Command::Wheel).unwrap();
                     }
                     Some(topic) => {
                         error!("Unexpected MQTT topic: \"{topic}\".");
@@ -187,22 +213,29 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
 
 fn tube_lamp_tick(
     led_driver: &mut Ws2812Esp32Rmt,
-    rx: &mpsc::Receiver<&str>,
+    rx: &mpsc::Receiver<Command>,
 ) -> Result<(), EspError> {
     debug!("Tube lamp tick");
-    let hue = unsafe { esp_random() } as u8;
-    led_driver
-        .write(
-            std::iter::repeat(hsv2rgb(Hsv {
-                hue: hue,
-                sat: 255,
-                val: 8,
-            }))
-            .take(NUM_LEDS),
-        )
-        .expect("Could not write to LED driver.");
+
     if let Ok(command) = rx.try_recv() {
-        info!("Received in lamp tick command: {command}");
+        info!("Received in lamp tick command: {command:?}");
+        match command {
+            Command::Hsv(hue, sat, val) => {
+                led_driver
+                    .write(
+                        std::iter::repeat(hsv2rgb(Hsv {
+                            hue: hue,
+                            sat: sat,
+                            val: val,
+                        }))
+                        .take(NUM_LEDS),
+                    )
+                    .expect("Could not write to LED driver.");
+            }
+            _ => {
+                warn!("Command not yet implemented.");
+            }
+        }
     }
     Ok(())
 }
