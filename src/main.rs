@@ -2,17 +2,23 @@
 extern crate dotenv_codegen;
 
 use core::pin::pin;
-use core::time::Duration;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use embassy_futures::select::{select, Either};
+use esp_idf_hal::modem::Modem;
+use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::mqtt::client::*;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::EspError;
 use esp_idf_svc::timer::{EspAsyncTimer, EspTaskTimerService, EspTimerService};
 use esp_idf_svc::wifi::*;
+use esp_idf_sys::esp_random;
 use log::*;
+use smart_leds::hsv::{hsv2rgb, Hsv};
+use smart_leds_trait::SmartLedsWrite;
+use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
 const SSID: &str = dotenv!("WLAN_SSID");
 const PASSWORD: &str = dotenv!("WLAN_PASSWORD");
@@ -30,39 +36,50 @@ const MQTT_TOPIC_PROGRESS: &str = "lamps/tube/progress";
 const MQTT_TOPIC_WHEEL_SPEED: &str = "lamps/tube/wheel_speed";
 const MQTT_TOPIC_LOG: &str = "lamps/tube/log";
 
+const NUM_LEDS: usize = 5;
+
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    let sys_loop = EspSystemEventLoop::take().unwrap();
-    let timer_service = EspTimerService::new().unwrap();
-    let nvs = EspDefaultNvsPartition::take().unwrap();
+    let sys_loop = EspSystemEventLoop::take().expect("Failed to take system event loop.");
+    let timer_service = EspTimerService::new().expect("Failed to create timer service.");
+    let nvs = EspDefaultNvsPartition::take().expect("Failed to take NVS partition.");
+
+    let peripherals = Peripherals::take().expect("Failed to take peripherals.");
+    let led_pin = peripherals.pins.gpio19;
+    let rmt_channel = peripherals.rmt.channel0;
+    let mut led_driver =
+        Ws2812Esp32Rmt::new(rmt_channel, led_pin).expect("Failed to create LED driver.");
 
     esp_idf_svc::hal::task::block_on(async {
-        let _wlan = connect_wlan(&sys_loop, &timer_service, &nvs)
+        let _wlan = connect_wlan(&sys_loop, &timer_service, &nvs, peripherals.modem)
             .await
             .expect("Failed to connect to WLAN.");
 
         let (mut client, mut conn) = connect_mqtt().expect("Failed to connect to MQTT broker.");
 
         let mut timer = timer_service.timer_async()?;
-        run_mqtt(&mut client, &mut conn, &mut timer).await
+        run_mqtt_and_led_loop(&mut client, &mut conn, &mut timer, &mut led_driver).await
     })
     .unwrap();
 }
 
-async fn run_mqtt(
+async fn run_mqtt_and_led_loop(
     client: &mut EspAsyncMqttClient,
     connection: &mut EspAsyncMqttConnection,
     timer: &mut EspAsyncTimer,
+    led_driver: &mut Ws2812Esp32Rmt<'_>,
 ) -> Result<(), EspError> {
+    let (tx, rx) = mpsc::channel();
+
     info!("About to start the MQTT connection.");
 
     let res = select(
         pin!(async move {
             info!("MQTT Listening for messages.");
             while let Ok(event) = connection.next().await {
-                handle_mqtt_event(&event.payload());
+                handle_mqtt_event(&event.payload(), &tx);
             }
             info!("Connection closed");
             Ok(())
@@ -92,7 +109,7 @@ async fn run_mqtt(
 
             timer.after(Duration::from_millis(500)).await?;
             loop {
-                tube_lamp_tick()?;
+                tube_lamp_tick(led_driver, &rx)?;
                 timer.after(Duration::from_millis(10)).await?;
             }
         }),
@@ -105,7 +122,7 @@ async fn run_mqtt(
     }
 }
 
-fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>) {
+fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Sender<&str>) {
     match event_payload {
         EventPayload::Received {
             id,
@@ -119,30 +136,37 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>) {
                     Some(MQTT_TOPIC_MODE) => {
                         info!("Received mode change message.");
                         warn!("Not yet implemented.");
+                        tx.send("mode").unwrap();
                     }
                     Some(MQTT_TOPIC_RGB) => {
                         info!("Received color change (RGB) message.");
                         warn!("Not yet implemented.");
+                        tx.send("rgb").unwrap();
                     }
                     Some(MQTT_TOPIC_HSV) => {
                         info!("Received color change (HSV) message.");
                         warn!("Not yet implemented.");
+                        tx.send("hsv").unwrap();
                     }
                     Some(MQTT_TOPIC_HEX) => {
                         info!("Received color change (HEX) message.");
                         warn!("Not yet implemented.");
+                        tx.send("hex").unwrap();
                     }
                     Some(MQTT_TOPIC_WARM) => {
                         info!("Received color change (warm) message.");
                         warn!("Not yet implemented.");
+                        tx.send("warm").unwrap();
                     }
                     Some(MQTT_TOPIC_PROGRESS) => {
                         info!("Received progress change message.");
                         warn!("Not yet implemented.");
+                        tx.send("progress").unwrap();
                     }
                     Some(MQTT_TOPIC_WHEEL_SPEED) => {
                         info!("Received wheel change message.");
                         warn!("Not yet implemented.");
+                        tx.send("wheel").unwrap();
                     }
                     Some(topic) => {
                         error!("Unexpected MQTT topic: \"{topic}\".");
@@ -161,9 +185,25 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>) {
     }
 }
 
-fn tube_lamp_tick() -> Result<(), EspError> {
+fn tube_lamp_tick(
+    led_driver: &mut Ws2812Esp32Rmt,
+    rx: &mpsc::Receiver<&str>,
+) -> Result<(), EspError> {
     debug!("Tube lamp tick");
-    warn!("Not yet implemented.");
+    let hue = unsafe { esp_random() } as u8;
+    led_driver
+        .write(
+            std::iter::repeat(hsv2rgb(Hsv {
+                hue: hue,
+                sat: 255,
+                val: 8,
+            }))
+            .take(NUM_LEDS),
+        )
+        .expect("Could not write to LED driver.");
+    if let Ok(command) = rx.try_recv() {
+        info!("Received in lamp tick command: {command}");
+    }
     Ok(())
 }
 
@@ -186,9 +226,9 @@ async fn connect_wlan(
     sys_loop: &EspSystemEventLoop,
     timer_service: &EspTaskTimerService,
     nvs: &EspDefaultNvsPartition,
+    modem: Modem,
 ) -> Result<EspWifi<'static>, EspError> {
-    let peripherals = Peripherals::take()?;
-    let mut esp_wlan = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?;
+    let mut esp_wlan = EspWifi::new(modem, sys_loop.clone(), Some(nvs.clone()))?;
     let mut wlan = AsyncWifi::wrap(&mut esp_wlan, sys_loop.clone(), timer_service.clone())?;
 
     wlan.set_configuration(&Configuration::Client(ClientConfiguration {
