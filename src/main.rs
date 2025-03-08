@@ -2,6 +2,8 @@
 extern crate dotenv_codegen;
 
 use core::pin::pin;
+use std::num::Wrapping;
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -15,7 +17,9 @@ use esp_idf_svc::sys::EspError;
 use esp_idf_svc::timer::{EspAsyncTimer, EspTaskTimerService, EspTimerService};
 use esp_idf_svc::wifi::*;
 use log::*;
+use once_cell::sync::Lazy;
 use smart_leds::hsv::{hsv2rgb, Hsv};
+use smart_leds::RGB8;
 use smart_leds_trait::SmartLedsWrite;
 use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
@@ -35,6 +39,17 @@ const MQTT_TOPIC_PROGRESS: &str = "lamps/tube/progress";
 const MQTT_TOPIC_WHEEL_SPEED: &str = "lamps/tube/wheel_speed";
 
 const NUM_LEDS: usize = 5;
+static RAINBOW_COLORS: Lazy<[RGB8; NUM_LEDS]> = Lazy::new(|| {
+    let mut rainbow_colors = [RGB8 { r: 0, g: 0, b: 0 }; NUM_LEDS];
+    for (idx, color) in rainbow_colors.iter_mut().enumerate() {
+        *color = hsv2rgb(Hsv {
+            hue: (idx * 255 / NUM_LEDS) as u8,
+            sat: 255,
+            val: 255,
+        });
+    }
+    rainbow_colors
+});
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -63,12 +78,63 @@ fn main() {
     .unwrap();
 }
 
+#[derive(Debug)]
+enum LampMode {
+    Color,
+    Rainbow,
+    Space,
+}
+
+impl core::str::FromStr for LampMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "color" => Ok(LampMode::Color),
+            "rainbow" => Ok(LampMode::Rainbow),
+            "space" => Ok(LampMode::Space),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Command {
+    Mode(LampMode),
+    Rgb,
+    Hsv(u8, u8, u8),
+    Hex,
+    Warm,
+    Progress,
+    WheelSpeed(u16),
+}
+
+#[derive(Debug)]
+struct Lampstate {
+    mode: LampMode,
+    color: RGB8,
+    wheel_pos: Wrapping<u16>,
+    wheel_speed: u16,
+}
+
+impl Lampstate {
+    fn new() -> Self {
+        Self {
+            mode: LampMode::Color,
+            color: RGB8 { r: 0, g: 0, b: 0 },
+            wheel_pos: Wrapping(0),
+            wheel_speed: 300,
+        }
+    }
+}
+
 async fn run_mqtt_and_led_loop(
     client: &mut EspAsyncMqttClient,
     connection: &mut EspAsyncMqttConnection,
     timer: &mut EspAsyncTimer,
     led_driver: &mut Ws2812Esp32Rmt<'_>,
 ) -> Result<(), EspError> {
+    let mut lampstate = Lampstate::new();
     let (tx, rx) = mpsc::channel();
 
     info!("About to start the MQTT connection.");
@@ -107,7 +173,7 @@ async fn run_mqtt_and_led_loop(
 
             timer.after(Duration::from_millis(500)).await?;
             loop {
-                tube_lamp_tick(led_driver, &rx)?;
+                tube_lamp_tick(led_driver, &mut lampstate, &rx)?;
                 timer.after(Duration::from_millis(10)).await?;
             }
         }),
@@ -118,17 +184,6 @@ async fn run_mqtt_and_led_loop(
         Either::First(res) => res,
         Either::Second(res) => res,
     }
-}
-
-#[derive(Debug)]
-enum Command {
-    Mode,
-    Rgb,
-    Hsv(u8, u8, u8),
-    Hex,
-    Warm,
-    Progress,
-    Wheel,
 }
 
 fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Sender<Command>) {
@@ -144,8 +199,12 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                 match topic {
                     Some(MQTT_TOPIC_MODE) => {
                         info!("Received mode change message.");
-                        warn!("Not yet implemented.");
-                        tx.send(Command::Mode).unwrap();
+                        if let Ok(lamp_mode) = LampMode::from_str(msg) {
+                            info!("Parsed lamp mode={lamp_mode:?}");
+                            tx.send(Command::Mode(lamp_mode)).unwrap();
+                        } else {
+                            warn!("Could not parse lamp mode.");
+                        }
                     }
                     Some(MQTT_TOPIC_RGB) => {
                         info!("Received color change (RGB) message.");
@@ -165,6 +224,7 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                                             "Parsed HSV values: hue={hue}, sat={sat}, val={val}."
                                         );
                                         tx.send(Command::Hsv(hue, sat, val)).unwrap();
+                                        tx.send(Command::Mode(LampMode::Color)).unwrap();
                                         msg_conv_successful = true;
                                     }
                                 }
@@ -191,8 +251,12 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                     }
                     Some(MQTT_TOPIC_WHEEL_SPEED) => {
                         info!("Received wheel change message.");
-                        warn!("Not yet implemented.");
-                        tx.send(Command::Wheel).unwrap();
+                        if let Ok(wheel_speed) = msg.parse::<u16>() {
+                            info!("Parsed wheel speed: {wheel_speed}.");
+                            tx.send(Command::WheelSpeed(wheel_speed)).unwrap();
+                        } else {
+                            warn!("Could not parse wheel speed.");
+                        }
                     }
                     Some(topic) => {
                         error!("Unexpected MQTT topic: \"{topic}\".");
@@ -213,31 +277,51 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
 
 fn tube_lamp_tick(
     led_driver: &mut Ws2812Esp32Rmt,
+    lamp_state: &mut Lampstate,
     rx: &mpsc::Receiver<Command>,
 ) -> Result<(), EspError> {
     debug!("Tube lamp tick");
 
+    let led_driver_res = match lamp_state.mode {
+        LampMode::Color => led_driver.write(std::iter::repeat(lamp_state.color).take(NUM_LEDS)),
+        LampMode::Space => led_driver.write((0..RAINBOW_COLORS.len()).map(|idx| {
+            let space_idx = (idx
+                + (lamp_state.wheel_pos.0 as usize * RAINBOW_COLORS.len() / u16::MAX as usize))
+                % RAINBOW_COLORS.len();
+            RAINBOW_COLORS[space_idx]
+        })),
+        _ => Ok(()),
+    };
+    led_driver_res.expect("Could not write to LED driver.");
+
     if let Ok(command) = rx.try_recv() {
         info!("Received in lamp tick command: {command:?}");
-        match command {
-            Command::Hsv(hue, sat, val) => {
-                led_driver
-                    .write(
-                        std::iter::repeat(hsv2rgb(Hsv {
-                            hue: hue,
-                            sat: sat,
-                            val: val,
-                        }))
-                        .take(NUM_LEDS),
-                    )
-                    .expect("Could not write to LED driver.");
-            }
-            _ => {
-                warn!("Command not yet implemented.");
-            }
+        update_lamp_state(lamp_state, command);
+    }
+
+    lamp_state.wheel_pos += lamp_state.wheel_speed;
+    Ok(())
+}
+
+fn update_lamp_state(lamp_state: &mut Lampstate, command: Command) {
+    match command {
+        Command::Mode(lamp_mode) => {
+            info!("Set lamp mode to: {lamp_mode:?}");
+            lamp_state.mode = lamp_mode;
+        }
+        Command::Hsv(hue, sat, val) => {
+            info!("Set lamp color to: hue={hue} sat={sat} val={val}");
+            lamp_state.color = hsv2rgb(Hsv { hue, sat, val });
+        }
+        Command::WheelSpeed(wheel_speed) => {
+            info!("Set wheel speed to: {wheel_speed}");
+            lamp_state.wheel_speed = wheel_speed;
+        }
+        _ => {
+            warn!("Command not yet implemented.");
         }
     }
-    Ok(())
+    info!("New lamp state: {lamp_state:?}");
 }
 
 fn connect_mqtt() -> Result<(EspAsyncMqttClient, EspAsyncMqttConnection), EspError> {
