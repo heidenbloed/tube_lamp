@@ -50,6 +50,17 @@ static RAINBOW_COLORS: Lazy<[RGB8; NUM_LEDS]> = Lazy::new(|| {
     }
     rainbow_colors
 });
+static WARM_COLORS: Lazy<[RGB8; u8::MAX as usize + 1]> = Lazy::new(|| {
+    let mut warm_colors = [RGB8 { r: 0, g: 0, b: 0 }; u8::MAX as usize + 1];
+    for (idx, color) in warm_colors.iter_mut().enumerate() {
+        *color = hsv2rgb(Hsv {
+            hue: 40,
+            sat: 160,
+            val: idx as u8,
+        });
+    }
+    warm_colors
+});
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -83,6 +94,7 @@ enum LampMode {
     Color,
     Rainbow,
     Space,
+    Progress,
 }
 
 impl core::str::FromStr for LampMode {
@@ -93,6 +105,7 @@ impl core::str::FromStr for LampMode {
             "color" => Ok(LampMode::Color),
             "rainbow" => Ok(LampMode::Rainbow),
             "space" => Ok(LampMode::Space),
+            "progress" => Ok(LampMode::Progress),
             _ => Err(()),
         }
     }
@@ -101,11 +114,10 @@ impl core::str::FromStr for LampMode {
 #[derive(Debug)]
 enum Command {
     Mode(LampMode),
-    Rgb,
+    Rgb(u8, u8, u8),
     Hsv(u8, u8, u8),
-    Hex,
-    Warm,
-    Progress,
+    Warm(u8),
+    Progress(u8),
     WheelSpeed(u16),
 }
 
@@ -115,6 +127,7 @@ struct Lampstate {
     color: RGB8,
     wheel_pos: Wrapping<u16>,
     wheel_speed: u16,
+    progress: u8,
 }
 
 impl Lampstate {
@@ -124,6 +137,7 @@ impl Lampstate {
             color: RGB8 { r: 0, g: 0, b: 0 },
             wheel_pos: Wrapping(0),
             wheel_speed: 300,
+            progress: 0,
         }
     }
 }
@@ -208,8 +222,26 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                     }
                     Some(MQTT_TOPIC_RGB) => {
                         info!("Received color change (RGB) message.");
-                        warn!("Not yet implemented.");
-                        tx.send(Command::Rgb).unwrap();
+                        let mut msg_conv_successful = false;
+                        let msg_split: Vec<_> =
+                            msg.split(",").take(3).map(|s| s.parse::<u8>()).collect();
+                        if msg_split.len() == 3 {
+                            if let Ok(red) = msg_split[0] {
+                                if let Ok(green) = msg_split[1] {
+                                    if let Ok(blue) = msg_split[2] {
+                                        info!(
+                                            "Parsed RGB values: red={red}, green={green}, blue={blue}."
+                                        );
+                                        tx.send(Command::Rgb(red, green, blue)).unwrap();
+                                        tx.send(Command::Mode(LampMode::Color)).unwrap();
+                                        msg_conv_successful = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !msg_conv_successful {
+                            warn!("Could not parse RGB values.");
+                        }
                     }
                     Some(MQTT_TOPIC_HSV) => {
                         info!("Received color change (HSV) message.");
@@ -236,18 +268,43 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                     }
                     Some(MQTT_TOPIC_HEX) => {
                         info!("Received color change (HEX) message.");
-                        warn!("Not yet implemented.");
-                        tx.send(Command::Hex).unwrap();
+                        let mut msg_conv_successful = false;
+                        let hex = msg.trim_start_matches('#');
+                        if hex.len() == 6 {
+                            if let Ok(red) = u8::from_str_radix(&hex[0..2], 16) {
+                                if let Ok(green) = u8::from_str_radix(&hex[2..4], 16) {
+                                    if let Ok(blue) = u8::from_str_radix(&hex[4..6], 16) {
+                                        info!(
+                                            "Parsed HEX values: red={red}, green={green}, blue={blue}."
+                                        );
+                                        tx.send(Command::Rgb(red, green, blue)).unwrap();
+                                        tx.send(Command::Mode(LampMode::Color)).unwrap();
+                                        msg_conv_successful = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !msg_conv_successful {
+                            warn!("Could not parse HEX values.");
+                        }
                     }
                     Some(MQTT_TOPIC_WARM) => {
                         info!("Received color change (warm) message.");
-                        warn!("Not yet implemented.");
-                        tx.send(Command::Warm).unwrap();
+                        if let Ok(warm_brightness) = msg.parse::<u8>() {
+                            info!("Parsed warm brightness: {warm_brightness}.");
+                            tx.send(Command::Warm(warm_brightness)).unwrap();
+                        } else {
+                            warn!("Could not parse warm brightness.");
+                        }
                     }
                     Some(MQTT_TOPIC_PROGRESS) => {
                         info!("Received progress change message.");
-                        warn!("Not yet implemented.");
-                        tx.send(Command::Progress).unwrap();
+                        if let Ok(progress) = msg.parse::<u8>() {
+                            info!("Parsed progress: {progress}.");
+                            tx.send(Command::Progress(progress)).unwrap();
+                        } else {
+                            warn!("Could not parse progress.");
+                        }
                     }
                     Some(MQTT_TOPIC_WHEEL_SPEED) => {
                         info!("Received wheel change message.");
@@ -284,13 +341,28 @@ fn tube_lamp_tick(
 
     let led_driver_res = match lamp_state.mode {
         LampMode::Color => led_driver.write(std::iter::repeat(lamp_state.color).take(NUM_LEDS)),
+        LampMode::Rainbow => led_driver.write(
+            std::iter::repeat(
+                RAINBOW_COLORS
+                    [lamp_state.wheel_pos.0 as usize * RAINBOW_COLORS.len() / u16::MAX as usize],
+            )
+            .take(NUM_LEDS),
+        ),
         LampMode::Space => led_driver.write((0..RAINBOW_COLORS.len()).map(|idx| {
             let space_idx = (idx
                 + (lamp_state.wheel_pos.0 as usize * RAINBOW_COLORS.len() / u16::MAX as usize))
                 % RAINBOW_COLORS.len();
             RAINBOW_COLORS[space_idx]
         })),
-        _ => Ok(()),
+        LampMode::Progress => {
+            let num_green_leds = lamp_state.progress as usize * NUM_LEDS / u8::MAX as usize;
+            let color_iter = std::iter::repeat(RGB8 { r: 0, g: 255, b: 0 })
+                .take(num_green_leds)
+                .chain(
+                    std::iter::repeat(RGB8 { r: 255, g: 0, b: 0 }).take(NUM_LEDS - num_green_leds),
+                );
+            led_driver.write(color_iter)
+        }
     };
     led_driver_res.expect("Could not write to LED driver.");
 
@@ -313,12 +385,25 @@ fn update_lamp_state(lamp_state: &mut Lampstate, command: Command) {
             info!("Set lamp color to: hue={hue} sat={sat} val={val}");
             lamp_state.color = hsv2rgb(Hsv { hue, sat, val });
         }
+        Command::Rgb(red, green, blue) => {
+            info!("Set lamp color to: red={red} green={green} blue={blue}");
+            lamp_state.color = RGB8 {
+                r: red,
+                g: green,
+                b: blue,
+            };
+        }
+        Command::Warm(warm_brightness) => {
+            info!("Set warm brightness to: {warm_brightness}");
+            lamp_state.color = WARM_COLORS[warm_brightness as usize];
+        }
+        Command::Progress(progress) => {
+            info!("Set progress to: {progress}");
+            lamp_state.progress = progress;
+        }
         Command::WheelSpeed(wheel_speed) => {
             info!("Set wheel speed to: {wheel_speed}");
             lamp_state.wheel_speed = wheel_speed;
-        }
-        _ => {
-            warn!("Command not yet implemented.");
         }
     }
     info!("New lamp state: {lamp_state:?}");
