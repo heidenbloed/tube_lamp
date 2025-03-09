@@ -354,15 +354,18 @@ fn tube_lamp_tick(
                 % RAINBOW_COLORS.len();
             RAINBOW_COLORS[space_idx]
         })),
-        LampMode::Progress => {
-            let num_green_leds = lamp_state.progress as usize * NUM_LEDS / u8::MAX as usize;
-            let color_iter = std::iter::repeat(RGB8 { r: 0, g: 255, b: 0 })
-                .take(num_green_leds)
-                .chain(
-                    std::iter::repeat(RGB8 { r: 255, g: 0, b: 0 }).take(NUM_LEDS - num_green_leds),
-                );
-            led_driver.write(color_iter)
-        }
+        LampMode::Progress => led_driver.write((0..NUM_LEDS).map(|idx| {
+            let hue: u8 = if idx < lamp_state.progress as usize * NUM_LEDS / u8::MAX as usize {
+                120
+            } else {
+                0
+            };
+            let wave_idx = (NUM_LEDS - idx
+                + lamp_state.wheel_pos.0 as usize * NUM_LEDS / u16::MAX as usize)
+                % NUM_LEDS;
+            let sat: u8 = 255 - (60 * wave_idx / NUM_LEDS) as u8;
+            hsv2rgb(Hsv { hue, sat, val: 255 })
+        })),
     };
     led_driver_res.expect("Could not write to LED driver.");
 
