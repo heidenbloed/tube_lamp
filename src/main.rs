@@ -7,14 +7,15 @@ use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use esp_idf_hal::modem::Modem;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::mqtt::client::*;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sys;
 use esp_idf_svc::sys::EspError;
-use esp_idf_svc::timer::{EspAsyncTimer, EspTaskTimerService, EspTimerService};
+use esp_idf_svc::timer::{EspTaskTimerService, EspTimerService, Task};
 use esp_idf_svc::wifi::*;
 use log::*;
 use once_cell::sync::Lazy;
@@ -54,8 +55,8 @@ static WARM_COLORS: Lazy<[RGB8; u8::MAX as usize + 1]> = Lazy::new(|| {
     let mut warm_colors = [RGB8 { r: 0, g: 0, b: 0 }; u8::MAX as usize + 1];
     for (idx, color) in warm_colors.iter_mut().enumerate() {
         *color = hsv2rgb(Hsv {
-            hue: 40,
-            sat: 160,
+            hue: 10,
+            sat: 230,
             val: idx as u8,
         });
     }
@@ -76,6 +77,17 @@ fn main() {
     let mut led_driver =
         Ws2812Esp32Rmt::new(rmt_channel, led_pin).expect("Failed to create LED driver.");
 
+    let touch_threshold = match init_touch_sensor() {
+        Ok(touch_threshold) => touch_threshold,
+        Err(err) => {
+            error!(
+                "Failed to initialize touch sensor: {} (code={}).",
+                err.msg, err.code
+            );
+            0
+        }
+    };
+
     esp_idf_svc::hal::task::block_on(async {
         let _wlan = connect_wlan(&sys_loop, &timer_service, &nvs, peripherals.modem)
             .await
@@ -83,14 +95,21 @@ fn main() {
 
         let (mut client, mut conn) = connect_mqtt().expect("Failed to connect to MQTT broker.");
 
-        let mut timer = timer_service.timer_async()?;
-        run_mqtt_and_led_loop(&mut client, &mut conn, &mut timer, &mut led_driver).await
+        run_mqtt_led_touch_loop(
+            &mut client,
+            &mut conn,
+            &timer_service,
+            &mut led_driver,
+            touch_threshold,
+        )
+        .await
     })
     .unwrap();
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 enum LampMode {
+    Off,
     Color,
     Rainbow,
     Space,
@@ -102,11 +121,24 @@ impl core::str::FromStr for LampMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "off" => Ok(LampMode::Off),
             "color" => Ok(LampMode::Color),
             "rainbow" => Ok(LampMode::Rainbow),
             "space" => Ok(LampMode::Space),
             "progress" => Ok(LampMode::Progress),
             _ => Err(()),
+        }
+    }
+}
+
+impl LampMode {
+    fn next(&self) -> LampMode {
+        match self {
+            LampMode::Off => LampMode::Color,
+            LampMode::Color => LampMode::Rainbow,
+            LampMode::Rainbow => LampMode::Space,
+            LampMode::Space => LampMode::Off,
+            LampMode::Progress => LampMode::Off,
         }
     }
 }
@@ -122,7 +154,7 @@ enum Command {
 }
 
 #[derive(Debug)]
-struct Lampstate {
+struct LampState {
     mode: LampMode,
     color: RGB8,
     wheel_pos: Wrapping<u16>,
@@ -130,11 +162,11 @@ struct Lampstate {
     progress: u8,
 }
 
-impl Lampstate {
+impl LampState {
     fn new() -> Self {
         Self {
-            mode: LampMode::Color,
-            color: RGB8 { r: 0, g: 0, b: 0 },
+            mode: LampMode::Off,
+            color: WARM_COLORS[10],
             wheel_pos: Wrapping(0),
             wheel_speed: 300,
             progress: 0,
@@ -142,22 +174,44 @@ impl Lampstate {
     }
 }
 
-async fn run_mqtt_and_led_loop(
+#[derive(Debug)]
+struct TouchState {
+    is_touched: bool,
+    current_lamp_mode: LampMode,
+}
+
+impl TouchState {
+    fn new() -> Self {
+        Self {
+            is_touched: false,
+            current_lamp_mode: LampMode::Off,
+        }
+    }
+}
+
+async fn run_mqtt_led_touch_loop(
     client: &mut EspAsyncMqttClient,
     connection: &mut EspAsyncMqttConnection,
-    timer: &mut EspAsyncTimer,
+    timer_service: &EspTimerService<Task>,
     led_driver: &mut Ws2812Esp32Rmt<'_>,
+    touch_threshold: u16,
 ) -> Result<(), EspError> {
-    let mut lampstate = Lampstate::new();
-    let (tx, rx) = mpsc::channel();
+    let mut lamp_state = LampState::new();
+    let mut touch_state = TouchState::new();
+
+    let (mqtt_cmd_sender, touch_cmd_receiver) = mpsc::channel();
+    let (touch_cmd_sender, lamp_cmd_receiver) = mpsc::channel();
 
     info!("About to start the MQTT connection.");
 
-    let res = select(
+    let mut lamp_timer = timer_service.timer_async()?;
+    let mut touch_timer = timer_service.timer_async()?;
+
+    let res: Either3<Result<(), EspError>, Result<(), EspError>, Result<(), EspError>> = select3(
         pin!(async move {
-            info!("MQTT Listening for messages.");
+            info!("Listening for MQTT messages.");
             while let Ok(event) = connection.next().await {
-                handle_mqtt_event(&event.payload(), &tx);
+                handle_mqtt_event(&event.payload(), &mqtt_cmd_sender);
             }
             info!("Connection closed");
             Ok(())
@@ -177,7 +231,7 @@ async fn run_mqtt_and_led_loop(
                 loop {
                     if let Err(e) = client.subscribe(topic, QoS::AtMostOnce).await {
                         error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
-                        timer.after(Duration::from_millis(500)).await?;
+                        lamp_timer.after(Duration::from_millis(500)).await?;
                         continue;
                     }
                     info!("Subscribed to topic \"{topic}\"");
@@ -185,22 +239,38 @@ async fn run_mqtt_and_led_loop(
                 }
             }
 
-            timer.after(Duration::from_millis(500)).await?;
+            lamp_timer.after(Duration::from_millis(500)).await?;
             loop {
-                tube_lamp_tick(led_driver, &mut lampstate, &rx)?;
-                timer.after(Duration::from_millis(10)).await?;
+                tube_lamp_tick(led_driver, &mut lamp_state, &lamp_cmd_receiver)?;
+                lamp_timer.after(Duration::from_millis(10)).await?;
+            }
+        }),
+        pin!(async move {
+            info!("Start touch sensor loop.");
+            loop {
+                touch_sensor_tick(
+                    touch_threshold,
+                    &mut touch_state,
+                    &touch_cmd_receiver,
+                    &touch_cmd_sender,
+                );
+                touch_timer.after(Duration::from_millis(10)).await?;
             }
         }),
     )
     .await;
 
     match res {
-        Either::First(res) => res,
-        Either::Second(res) => res,
+        Either3::First(res) => res,
+        Either3::Second(res) => res,
+        Either3::Third(res) => res,
     }
 }
 
-fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Sender<Command>) {
+fn handle_mqtt_event(
+    event_payload: &EventPayload<'_, EspError>,
+    cmd_sender: &mpsc::Sender<Command>,
+) {
     match event_payload {
         EventPayload::Received {
             id,
@@ -215,7 +285,7 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                         info!("Received mode change message.");
                         if let Ok(lamp_mode) = LampMode::from_str(msg) {
                             info!("Parsed lamp mode={lamp_mode:?}");
-                            tx.send(Command::Mode(lamp_mode)).unwrap();
+                            cmd_sender.send(Command::Mode(lamp_mode)).unwrap();
                         } else {
                             warn!("Could not parse lamp mode.");
                         }
@@ -232,8 +302,8 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                                         info!(
                                             "Parsed RGB values: red={red}, green={green}, blue={blue}."
                                         );
-                                        tx.send(Command::Rgb(red, green, blue)).unwrap();
-                                        tx.send(Command::Mode(LampMode::Color)).unwrap();
+                                        cmd_sender.send(Command::Mode(LampMode::Color)).unwrap();
+                                        cmd_sender.send(Command::Rgb(red, green, blue)).unwrap();
                                         msg_conv_successful = true;
                                     }
                                 }
@@ -255,8 +325,8 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                                         info!(
                                             "Parsed HSV values: hue={hue}, sat={sat}, val={val}."
                                         );
-                                        tx.send(Command::Hsv(hue, sat, val)).unwrap();
-                                        tx.send(Command::Mode(LampMode::Color)).unwrap();
+                                        cmd_sender.send(Command::Mode(LampMode::Color)).unwrap();
+                                        cmd_sender.send(Command::Hsv(hue, sat, val)).unwrap();
                                         msg_conv_successful = true;
                                     }
                                 }
@@ -277,8 +347,8 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                                         info!(
                                             "Parsed HEX values: red={red}, green={green}, blue={blue}."
                                         );
-                                        tx.send(Command::Rgb(red, green, blue)).unwrap();
-                                        tx.send(Command::Mode(LampMode::Color)).unwrap();
+                                        cmd_sender.send(Command::Mode(LampMode::Color)).unwrap();
+                                        cmd_sender.send(Command::Rgb(red, green, blue)).unwrap();
                                         msg_conv_successful = true;
                                     }
                                 }
@@ -292,7 +362,8 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                         info!("Received color change (warm) message.");
                         if let Ok(warm_brightness) = msg.parse::<u8>() {
                             info!("Parsed warm brightness: {warm_brightness}.");
-                            tx.send(Command::Warm(warm_brightness)).unwrap();
+                            cmd_sender.send(Command::Mode(LampMode::Color)).unwrap();
+                            cmd_sender.send(Command::Warm(warm_brightness)).unwrap();
                         } else {
                             warn!("Could not parse warm brightness.");
                         }
@@ -301,7 +372,7 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                         info!("Received progress change message.");
                         if let Ok(progress) = msg.parse::<u8>() {
                             info!("Parsed progress: {progress}.");
-                            tx.send(Command::Progress(progress)).unwrap();
+                            cmd_sender.send(Command::Progress(progress)).unwrap();
                         } else {
                             warn!("Could not parse progress.");
                         }
@@ -310,7 +381,7 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
                         info!("Received wheel change message.");
                         if let Ok(wheel_speed) = msg.parse::<u16>() {
                             info!("Parsed wheel speed: {wheel_speed}.");
-                            tx.send(Command::WheelSpeed(wheel_speed)).unwrap();
+                            cmd_sender.send(Command::WheelSpeed(wheel_speed)).unwrap();
                         } else {
                             warn!("Could not parse wheel speed.");
                         }
@@ -332,14 +403,62 @@ fn handle_mqtt_event(event_payload: &EventPayload<'_, EspError>, tx: &mpsc::Send
     }
 }
 
+fn touch_sensor_tick(
+    touch_threshold: u16,
+    touch_state: &mut TouchState,
+    cmd_receiver: &mpsc::Receiver<Command>,
+    cmd_sender: &mpsc::Sender<Command>,
+) {
+    debug!("Touch sensor tick.");
+    if touch_threshold > 0 {
+        match touch_sensor_read() {
+            Ok(touch_value) => {
+                if touch_value < touch_threshold {
+                    if !touch_state.is_touched {
+                        info!("Touch detected: {touch_value}");
+                        touch_state.is_touched = true;
+
+                        let new_lamp_state = touch_state.current_lamp_mode.next();
+                        touch_state.current_lamp_mode = new_lamp_state;
+                        cmd_sender.send(Command::Mode(new_lamp_state)).unwrap();
+                    }
+                } else {
+                    if touch_state.is_touched {
+                        info!("Touch released: {touch_value}");
+                        touch_state.is_touched = false;
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    "Failed to read touch sensor: {} (code: {})",
+                    err.msg, err.code
+                );
+            }
+        }
+    }
+
+    for command in cmd_receiver.try_iter() {
+        info!("Received in touch tick: {command:?}");
+        match command {
+            Command::Mode(new_mode) => touch_state.current_lamp_mode = new_mode,
+            _ => (),
+        }
+        cmd_sender.send(command).unwrap();
+    }
+}
+
 fn tube_lamp_tick(
     led_driver: &mut Ws2812Esp32Rmt,
-    lamp_state: &mut Lampstate,
-    rx: &mpsc::Receiver<Command>,
+    lamp_state: &mut LampState,
+    cmd_receiver: &mpsc::Receiver<Command>,
 ) -> Result<(), EspError> {
     debug!("Tube lamp tick");
 
     let led_driver_res = match lamp_state.mode {
+        LampMode::Off => {
+            led_driver.write(std::iter::repeat(RGB8 { r: 0, g: 0, b: 0 }).take(NUM_LEDS))
+        }
         LampMode::Color => led_driver.write(std::iter::repeat(lamp_state.color).take(NUM_LEDS)),
         LampMode::Rainbow => led_driver.write(
             std::iter::repeat(
@@ -369,8 +488,8 @@ fn tube_lamp_tick(
     };
     led_driver_res.expect("Could not write to LED driver.");
 
-    if let Ok(command) = rx.try_recv() {
-        info!("Received in lamp tick command: {command:?}");
+    for command in cmd_receiver.try_iter() {
+        info!("Received in lamp tick: {command:?}");
         update_lamp_state(lamp_state, command);
     }
 
@@ -378,7 +497,7 @@ fn tube_lamp_tick(
     Ok(())
 }
 
-fn update_lamp_state(lamp_state: &mut Lampstate, command: Command) {
+fn update_lamp_state(lamp_state: &mut LampState, command: Command) {
     match command {
         Command::Mode(lamp_mode) => {
             info!("Set lamp mode to: {lamp_mode:?}");
@@ -408,6 +527,10 @@ fn update_lamp_state(lamp_state: &mut Lampstate, command: Command) {
             info!("Set wheel speed to: {wheel_speed}");
             lamp_state.wheel_speed = wheel_speed;
         }
+    }
+    if (lamp_state.mode == LampMode::Color) && (lamp_state.color == RGB8 { r: 0, g: 0, b: 0 }) {
+        lamp_state.mode = LampMode::Off;
+        lamp_state.color = WARM_COLORS[10];
     }
     info!("New lamp state: {lamp_state:?}");
 }
@@ -450,4 +573,74 @@ async fn connect_wlan(
     info!("WLAN netif up.");
 
     Ok(esp_wlan)
+}
+
+struct TouchPadErr {
+    code: i32,
+    msg: &'static str,
+}
+
+fn init_touch_sensor() -> Result<u16, TouchPadErr> {
+    let res = unsafe { sys::touch_pad_init() };
+    if res != sys::ESP_OK {
+        return Err(TouchPadErr {
+            code: res,
+            msg: "Touch pad init failed.",
+        });
+    }
+    info!("Touch pad init success.");
+
+    let res = unsafe {
+        sys::touch_pad_set_voltage(
+            sys::touch_high_volt_t_TOUCH_HVOLT_2V7,
+            sys::touch_low_volt_t_TOUCH_LVOLT_0V5,
+            sys::touch_volt_atten_t_TOUCH_HVOLT_ATTEN_1V,
+        )
+    };
+    if res != sys::ESP_OK {
+        return Err(TouchPadErr {
+            code: res,
+            msg: "Touch pad set voltage failed.",
+        });
+    }
+    info!("Touch pad set voltage success.");
+
+    let res = unsafe { sys::touch_pad_config(sys::touch_pad_t_TOUCH_PAD_NUM0, 0) };
+    if res != sys::ESP_OK {
+        return Err(TouchPadErr {
+            code: res,
+            msg: "Touch pad config failed.",
+        });
+    }
+    info!("Touch pad config success.");
+
+    let res = unsafe { sys::touch_pad_filter_start(10) };
+    if res != sys::ESP_OK {
+        return Err(TouchPadErr {
+            code: res,
+            msg: "Touch pad filter start failed.",
+        });
+    }
+    info!("Touch pad filter start success.");
+
+    let init_touch_value: u16 = touch_sensor_read()?;
+    info!("Initial touch pad filtered value: {init_touch_value}");
+
+    let touch_threshold = init_touch_value * 2 / 3;
+    info!("Touch threshold value: {touch_threshold}");
+
+    Ok(touch_threshold)
+}
+
+fn touch_sensor_read() -> Result<u16, TouchPadErr> {
+    let mut touch_value: u16 = 0;
+    let res =
+        unsafe { sys::touch_pad_read_filtered(sys::touch_pad_t_TOUCH_PAD_NUM0, &mut touch_value) };
+    if res != sys::ESP_OK {
+        return Err(TouchPadErr {
+            code: res,
+            msg: "Touch pad filtered read failed.",
+        });
+    }
+    Ok(touch_value)
 }
