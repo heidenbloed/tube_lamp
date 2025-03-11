@@ -77,14 +77,14 @@ fn main() {
     let mut led_driver =
         Ws2812Esp32Rmt::new(rmt_channel, led_pin).expect("Failed to create LED driver.");
 
-    let touch_threshold = match init_touch_sensor() {
-        Ok(touch_threshold) => touch_threshold,
+    let touch_thresholds = match init_touch_sensor() {
+        Ok(touch_thresholds) => Some(touch_thresholds),
         Err(err) => {
             error!(
                 "Failed to initialize touch sensor: {} (code={}).",
                 err.msg, err.code
             );
-            0
+            None
         }
     };
 
@@ -100,7 +100,7 @@ fn main() {
             &mut conn,
             &timer_service,
             &mut led_driver,
-            touch_threshold,
+            touch_thresholds,
         )
         .await
     })
@@ -166,7 +166,7 @@ impl LampState {
     fn new() -> Self {
         Self {
             mode: LampMode::Off,
-            color: WARM_COLORS[10],
+            color: WARM_COLORS[(u8::MAX / 5) as usize],
             wheel_pos: Wrapping(0),
             wheel_speed: 300,
             progress: 0,
@@ -176,15 +176,19 @@ impl LampState {
 
 #[derive(Debug)]
 struct TouchState {
-    is_touched: bool,
+    is_touched_mode: bool,
+    is_touched_bright: bool,
     current_lamp_mode: LampMode,
+    current_warm_brightness: u8,
 }
 
 impl TouchState {
     fn new() -> Self {
         Self {
-            is_touched: false,
+            is_touched_mode: false,
+            is_touched_bright: false,
             current_lamp_mode: LampMode::Off,
+            current_warm_brightness: u8::MAX / 5,
         }
     }
 }
@@ -194,7 +198,7 @@ async fn run_mqtt_led_touch_loop(
     connection: &mut EspAsyncMqttConnection,
     timer_service: &EspTimerService<Task>,
     led_driver: &mut Ws2812Esp32Rmt<'_>,
-    touch_threshold: u16,
+    touch_thresholds: Option<(u16, u16)>,
 ) -> Result<(), EspError> {
     let mut lamp_state = LampState::new();
     let mut touch_state = TouchState::new();
@@ -249,7 +253,7 @@ async fn run_mqtt_led_touch_loop(
             info!("Start touch sensor loop.");
             loop {
                 touch_sensor_tick(
-                    touch_threshold,
+                    touch_thresholds,
                     &mut touch_state,
                     &touch_cmd_receiver,
                     &touch_cmd_sender,
@@ -404,28 +408,53 @@ fn handle_mqtt_event(
 }
 
 fn touch_sensor_tick(
-    touch_threshold: u16,
+    touch_thresholds: Option<(u16, u16)>,
     touch_state: &mut TouchState,
     cmd_receiver: &mpsc::Receiver<Command>,
     cmd_sender: &mpsc::Sender<Command>,
 ) {
     debug!("Touch sensor tick.");
-    if touch_threshold > 0 {
+    if let Some((touch_threshold_mode, touch_threshold_bright)) = touch_thresholds {
         match touch_sensor_read() {
-            Ok(touch_value) => {
-                if touch_value < touch_threshold {
-                    if !touch_state.is_touched {
-                        info!("Touch detected: {touch_value}");
-                        touch_state.is_touched = true;
+            Ok((touch_value_mode, touch_value_bright)) => {
+                if touch_value_mode < touch_threshold_mode {
+                    if !touch_state.is_touched_mode {
+                        info!("Touch detected (mode).");
+                        touch_state.is_touched_mode = true;
 
                         let new_lamp_state = touch_state.current_lamp_mode.next();
                         touch_state.current_lamp_mode = new_lamp_state;
                         cmd_sender.send(Command::Mode(new_lamp_state)).unwrap();
                     }
                 } else {
-                    if touch_state.is_touched {
-                        info!("Touch released: {touch_value}");
-                        touch_state.is_touched = false;
+                    if touch_state.is_touched_mode {
+                        touch_state.is_touched_mode = false;
+                    }
+                }
+
+                if touch_value_bright < touch_threshold_bright {
+                    if !touch_state.is_touched_bright {
+                        info!("Touch detected (bright).");
+                        touch_state.is_touched_bright = true;
+
+                        let new_warm_brightness = if touch_state.current_warm_brightness == u8::MAX
+                        {
+                            0
+                        } else if touch_state.current_warm_brightness
+                            > (u8::MAX as u16 * 4 / 5) as u8
+                        {
+                            u8::MAX
+                        } else {
+                            touch_state.current_warm_brightness + u8::MAX / 5
+                        };
+                        touch_state.current_lamp_mode = LampMode::Color;
+                        touch_state.current_warm_brightness = new_warm_brightness;
+                        cmd_sender.send(Command::Mode(LampMode::Color)).unwrap();
+                        cmd_sender.send(Command::Warm(new_warm_brightness)).unwrap();
+                    }
+                } else {
+                    if touch_state.is_touched_bright {
+                        touch_state.is_touched_bright = false;
                     }
                 }
             }
@@ -442,6 +471,7 @@ fn touch_sensor_tick(
         info!("Received in touch tick: {command:?}");
         match command {
             Command::Mode(new_mode) => touch_state.current_lamp_mode = new_mode,
+            Command::Warm(new_brightness) => touch_state.current_warm_brightness = new_brightness,
             _ => (),
         }
         cmd_sender.send(command).unwrap();
@@ -530,7 +560,7 @@ fn update_lamp_state(lamp_state: &mut LampState, command: Command) {
     }
     if (lamp_state.mode == LampMode::Color) && (lamp_state.color == RGB8 { r: 0, g: 0, b: 0 }) {
         lamp_state.mode = LampMode::Off;
-        lamp_state.color = WARM_COLORS[10];
+        lamp_state.color = WARM_COLORS[(u8::MAX / 5) as usize];
     }
     info!("New lamp state: {lamp_state:?}");
 }
@@ -580,7 +610,7 @@ struct TouchPadErr {
     msg: &'static str,
 }
 
-fn init_touch_sensor() -> Result<u16, TouchPadErr> {
+fn init_touch_sensor() -> Result<(u16, u16), TouchPadErr> {
     let res = unsafe { sys::touch_pad_init() };
     if res != sys::ESP_OK {
         return Err(TouchPadErr {
@@ -609,7 +639,14 @@ fn init_touch_sensor() -> Result<u16, TouchPadErr> {
     if res != sys::ESP_OK {
         return Err(TouchPadErr {
             code: res,
-            msg: "Touch pad config failed.",
+            msg: "Touch pad 0 config failed.",
+        });
+    }
+    let res = unsafe { sys::touch_pad_config(sys::touch_pad_t_TOUCH_PAD_NUM2, 0) };
+    if res != sys::ESP_OK {
+        return Err(TouchPadErr {
+            code: res,
+            msg: "Touch pad 1 config failed.",
         });
     }
     info!("Touch pad config success.");
@@ -623,24 +660,36 @@ fn init_touch_sensor() -> Result<u16, TouchPadErr> {
     }
     info!("Touch pad filter start success.");
 
-    let init_touch_value: u16 = touch_sensor_read()?;
-    info!("Initial touch pad filtered value: {init_touch_value}");
+    let (init_touch_value_0, init_touch_value_1) = touch_sensor_read()?;
+    info!("Initial touch pad filtered values: 0:{init_touch_value_0}, 1:{init_touch_value_1}");
 
-    let touch_threshold = init_touch_value * 2 / 3;
-    info!("Touch threshold value: {touch_threshold}");
+    let touch_threshold_0 = init_touch_value_0 * 2 / 3;
+    let touch_threshold_1 = init_touch_value_1 * 2 / 3;
+    info!("Touch threshold value: 0:{touch_threshold_0}, 1:{touch_threshold_1}");
 
-    Ok(touch_threshold)
+    Ok((touch_threshold_0, touch_threshold_1))
 }
 
-fn touch_sensor_read() -> Result<u16, TouchPadErr> {
-    let mut touch_value: u16 = 0;
-    let res =
-        unsafe { sys::touch_pad_read_filtered(sys::touch_pad_t_TOUCH_PAD_NUM0, &mut touch_value) };
+fn touch_sensor_read() -> Result<(u16, u16), TouchPadErr> {
+    let mut touch_value_0: u16 = 0;
+    let mut touch_value_1: u16 = 0;
+    let res = unsafe {
+        sys::touch_pad_read_filtered(sys::touch_pad_t_TOUCH_PAD_NUM0, &mut touch_value_0)
+    };
     if res != sys::ESP_OK {
         return Err(TouchPadErr {
             code: res,
-            msg: "Touch pad filtered read failed.",
+            msg: "Touch pad 0 filtered read failed.",
         });
     }
-    Ok(touch_value)
+    let res = unsafe {
+        sys::touch_pad_read_filtered(sys::touch_pad_t_TOUCH_PAD_NUM2, &mut touch_value_1)
+    };
+    if res != sys::ESP_OK {
+        return Err(TouchPadErr {
+            code: res,
+            msg: "Touch pad 1 filtered read failed.",
+        });
+    }
+    Ok((touch_value_0, touch_value_1))
 }
