@@ -6,7 +6,9 @@ use std::{iter, pin, str, str::FromStr};
 use dotenv_codegen::dotenv;
 use embassy_futures::select;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::{modem::Modem, peripherals::Peripherals, task};
+use esp_idf_svc::hal::{
+    modem::Modem, peripherals::Peripherals, rmt::config::TransmitConfig, rmt::TxRmtDriver, task,
+};
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::mqtt::client::{
     EspAsyncMqttClient, EspAsyncMqttConnection, EventPayload, MqttClientConfiguration, QoS,
@@ -36,7 +38,7 @@ const MQTT_TOPIC_WARM: &str = "lamps/tube/warm";
 const MQTT_TOPIC_PROGRESS: &str = "lamps/tube/progress";
 const MQTT_TOPIC_WHEEL_SPEED: &str = "lamps/tube/wheel_speed";
 
-const NUM_LEDS: usize = 5;
+const NUM_LEDS: usize = 54;
 static RAINBOW_COLORS: Lazy<[RGB8; NUM_LEDS]> = Lazy::new(|| {
     let mut rainbow_colors = [RGB8 { r: 0, g: 0, b: 0 }; NUM_LEDS];
     for (idx, color) in rainbow_colors.iter_mut().enumerate() {
@@ -71,8 +73,11 @@ fn main() {
     let peripherals = Peripherals::take().expect("Failed to take peripherals.");
     let led_pin = peripherals.pins.gpio19;
     let rmt_channel = peripherals.rmt.channel0;
+    let rmt_config = TransmitConfig::new().clock_divider(1).mem_block_num(8);
+    let rmt_driver =
+        TxRmtDriver::new(rmt_channel, led_pin, &rmt_config).expect("Failed to create RMT driver.");
     let mut led_driver =
-        Ws2812Esp32Rmt::new(rmt_channel, led_pin).expect("Failed to create LED driver.");
+        Ws2812Esp32Rmt::new_with_rmt_driver(rmt_driver).expect("Failed to create LED driver.");
 
     let touch_thresholds = match init_touch_sensor() {
         Ok(touch_thresholds) => Some(touch_thresholds),
