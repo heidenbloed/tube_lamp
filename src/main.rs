@@ -426,10 +426,8 @@ fn touch_sensor_tick(
                         touch_state.current_lamp_mode = new_lamp_state;
                         cmd_sender.send(Command::Mode(new_lamp_state)).unwrap();
                     }
-                } else {
-                    if touch_state.is_touched_mode {
-                        touch_state.is_touched_mode = false;
-                    }
+                } else if touch_state.is_touched_mode {
+                    touch_state.is_touched_mode = false;
                 }
 
                 if touch_value_bright < touch_threshold_bright {
@@ -452,10 +450,8 @@ fn touch_sensor_tick(
                         cmd_sender.send(Command::Mode(LampMode::Color)).unwrap();
                         cmd_sender.send(Command::Warm(new_warm_brightness)).unwrap();
                     }
-                } else {
-                    if touch_state.is_touched_bright {
-                        touch_state.is_touched_bright = false;
-                    }
+                } else if touch_state.is_touched_bright {
+                    touch_state.is_touched_bright = false;
                 }
             }
             Err(err) => {
