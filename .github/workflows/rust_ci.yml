@@ -10,6 +10,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  WLAN_SSID: ${{ secrets.WLAN_SSID }}
+  WLAN_PASSWORD: ${{ secrets.WLAN_PASSWORD }}
+  MQTT_URL: ${{ secrets.MQTT_URL }}
+  MQTT_USERNAME: ${{ secrets.MQTT_USERNAME }}
+  MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
+  MQTT_CLIENT_ID: ${{ secrets.MQTT_CLIENT_ID }}
 
 jobs:
   rust-checks:
