@@ -1,26 +1,23 @@
-#[macro_use]
-extern crate dotenv_codegen;
-
-use core::pin::pin;
 use std::num::Wrapping;
-use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Duration;
+use std::{iter, pin, str, str::FromStr};
 
-use embassy_futures::select::{select3, Either3};
-use esp_idf_hal::modem::Modem;
-use esp_idf_hal::peripherals::Peripherals;
+use dotenv_codegen::dotenv;
+use embassy_futures::select;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::mqtt::client::*;
+use esp_idf_svc::hal::{modem::Modem, peripherals::Peripherals, task};
+use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::mqtt::client::{
+    EspAsyncMqttClient, EspAsyncMqttConnection, EventPayload, MqttClientConfiguration, QoS,
+};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sys;
-use esp_idf_svc::sys::EspError;
+use esp_idf_svc::sys::{self, EspError};
 use esp_idf_svc::timer::{EspTaskTimerService, EspTimerService, Task};
-use esp_idf_svc::wifi::*;
-use log::*;
+use esp_idf_svc::wifi::{AsyncWifi, ClientConfiguration, Configuration, EspWifi};
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
-use smart_leds::hsv::{hsv2rgb, Hsv};
-use smart_leds::RGB8;
+use smart_leds::{hsv, RGB8};
 use smart_leds_trait::SmartLedsWrite;
 use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
@@ -43,7 +40,7 @@ const NUM_LEDS: usize = 5;
 static RAINBOW_COLORS: Lazy<[RGB8; NUM_LEDS]> = Lazy::new(|| {
     let mut rainbow_colors = [RGB8 { r: 0, g: 0, b: 0 }; NUM_LEDS];
     for (idx, color) in rainbow_colors.iter_mut().enumerate() {
-        *color = hsv2rgb(Hsv {
+        *color = hsv::hsv2rgb(hsv::Hsv {
             hue: (idx * 255 / NUM_LEDS) as u8,
             sat: 255,
             val: 255,
@@ -54,7 +51,7 @@ static RAINBOW_COLORS: Lazy<[RGB8; NUM_LEDS]> = Lazy::new(|| {
 static WARM_COLORS: Lazy<[RGB8; u8::MAX as usize + 1]> = Lazy::new(|| {
     let mut warm_colors = [RGB8 { r: 0, g: 0, b: 0 }; u8::MAX as usize + 1];
     for (idx, color) in warm_colors.iter_mut().enumerate() {
-        *color = hsv2rgb(Hsv {
+        *color = hsv::hsv2rgb(hsv::Hsv {
             hue: 10,
             sat: 230,
             val: idx as u8,
@@ -64,8 +61,8 @@ static WARM_COLORS: Lazy<[RGB8; u8::MAX as usize + 1]> = Lazy::new(|| {
 });
 
 fn main() {
-    esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+    sys::link_patches();
+    EspLogger::initialize_default();
 
     let sys_loop = EspSystemEventLoop::take().expect("Failed to take system event loop.");
     let timer_service = EspTimerService::new().expect("Failed to create timer service.");
@@ -88,7 +85,7 @@ fn main() {
         }
     };
 
-    esp_idf_svc::hal::task::block_on(async {
+    task::block_on(async {
         let _wlan = connect_wlan(&sys_loop, &timer_service, &nvs, peripherals.modem)
             .await
             .expect("Failed to connect to WLAN.");
@@ -116,7 +113,7 @@ enum LampMode {
     Progress,
 }
 
-impl core::str::FromStr for LampMode {
+impl FromStr for LampMode {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -211,63 +208,64 @@ async fn run_mqtt_led_touch_loop(
     let mut lamp_timer = timer_service.timer_async()?;
     let mut touch_timer = timer_service.timer_async()?;
 
-    let res: Either3<Result<(), EspError>, Result<(), EspError>, Result<(), EspError>> = select3(
-        pin!(async move {
-            info!("Listening for MQTT messages.");
-            while let Ok(event) = connection.next().await {
-                handle_mqtt_event(&event.payload(), &mqtt_cmd_sender);
-            }
-            info!("Connection closed");
-            Ok(())
-        }),
-        pin!(async move {
-            for topic in [
-                MQTT_TOPIC_MODE,
-                MQTT_TOPIC_RGB,
-                MQTT_TOPIC_HSV,
-                MQTT_TOPIC_HEX,
-                MQTT_TOPIC_WARM,
-                MQTT_TOPIC_PROGRESS,
-                MQTT_TOPIC_WHEEL_SPEED,
-            ]
-            .iter()
-            {
-                loop {
-                    if let Err(e) = client.subscribe(topic, QoS::AtMostOnce).await {
-                        error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
-                        lamp_timer.after(Duration::from_millis(500)).await?;
-                        continue;
-                    }
-                    info!("Subscribed to topic \"{topic}\"");
-                    break;
+    let res: select::Either3<Result<(), EspError>, Result<(), EspError>, Result<(), EspError>> =
+        select::select3(
+            pin::pin!(async move {
+                info!("Listening for MQTT messages.");
+                while let Ok(event) = connection.next().await {
+                    handle_mqtt_event(&event.payload(), &mqtt_cmd_sender);
                 }
-            }
+                info!("Connection closed");
+                Ok(())
+            }),
+            pin::pin!(async move {
+                for topic in [
+                    MQTT_TOPIC_MODE,
+                    MQTT_TOPIC_RGB,
+                    MQTT_TOPIC_HSV,
+                    MQTT_TOPIC_HEX,
+                    MQTT_TOPIC_WARM,
+                    MQTT_TOPIC_PROGRESS,
+                    MQTT_TOPIC_WHEEL_SPEED,
+                ]
+                .iter()
+                {
+                    loop {
+                        if let Err(e) = client.subscribe(topic, QoS::AtMostOnce).await {
+                            error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
+                            lamp_timer.after(Duration::from_millis(500)).await?;
+                            continue;
+                        }
+                        info!("Subscribed to topic \"{topic}\"");
+                        break;
+                    }
+                }
 
-            lamp_timer.after(Duration::from_millis(500)).await?;
-            loop {
-                tube_lamp_tick(led_driver, &mut lamp_state, &lamp_cmd_receiver)?;
-                lamp_timer.after(Duration::from_millis(10)).await?;
-            }
-        }),
-        pin!(async move {
-            info!("Start touch sensor loop.");
-            loop {
-                touch_sensor_tick(
-                    touch_thresholds,
-                    &mut touch_state,
-                    &touch_cmd_receiver,
-                    &touch_cmd_sender,
-                );
-                touch_timer.after(Duration::from_millis(10)).await?;
-            }
-        }),
-    )
-    .await;
+                lamp_timer.after(Duration::from_millis(500)).await?;
+                loop {
+                    tube_lamp_tick(led_driver, &mut lamp_state, &lamp_cmd_receiver)?;
+                    lamp_timer.after(Duration::from_millis(10)).await?;
+                }
+            }),
+            pin::pin!(async move {
+                info!("Start touch sensor loop.");
+                loop {
+                    touch_sensor_tick(
+                        touch_thresholds,
+                        &mut touch_state,
+                        &touch_cmd_receiver,
+                        &touch_cmd_sender,
+                    );
+                    touch_timer.after(Duration::from_millis(10)).await?;
+                }
+            }),
+        )
+        .await;
 
     match res {
-        Either3::First(res) => res,
-        Either3::Second(res) => res,
-        Either3::Third(res) => res,
+        select::Either3::First(res) => res,
+        select::Either3::Second(res) => res,
+        select::Either3::Third(res) => res,
     }
 }
 
@@ -282,7 +280,7 @@ fn handle_mqtt_event(
             data,
             details: _,
         } => {
-            if let Ok(msg) = core::str::from_utf8(data) {
+            if let Ok(msg) = str::from_utf8(data) {
                 info!("Received MQTT message from id \"{id}\" on topic \"{topic:?}\": {msg:?}.");
                 match topic {
                     Some(MQTT_TOPIC_MODE) => {
@@ -482,12 +480,10 @@ fn tube_lamp_tick(
     debug!("Tube lamp tick");
 
     let led_driver_res = match lamp_state.mode {
-        LampMode::Off => {
-            led_driver.write(std::iter::repeat(RGB8 { r: 0, g: 0, b: 0 }).take(NUM_LEDS))
-        }
-        LampMode::Color => led_driver.write(std::iter::repeat(lamp_state.color).take(NUM_LEDS)),
+        LampMode::Off => led_driver.write(iter::repeat(RGB8 { r: 0, g: 0, b: 0 }).take(NUM_LEDS)),
+        LampMode::Color => led_driver.write(iter::repeat(lamp_state.color).take(NUM_LEDS)),
         LampMode::Rainbow => led_driver.write(
-            std::iter::repeat(
+            iter::repeat(
                 RAINBOW_COLORS
                     [lamp_state.wheel_pos.0 as usize * RAINBOW_COLORS.len() / u16::MAX as usize],
             )
@@ -509,7 +505,7 @@ fn tube_lamp_tick(
                 + lamp_state.wheel_pos.0 as usize * NUM_LEDS / u16::MAX as usize)
                 % NUM_LEDS;
             let sat: u8 = 255 - (60 * wave_idx / NUM_LEDS) as u8;
-            hsv2rgb(Hsv { hue, sat, val: 255 })
+            hsv::hsv2rgb(hsv::Hsv { hue, sat, val: 255 })
         })),
     };
     led_driver_res.expect("Could not write to LED driver.");
@@ -531,7 +527,7 @@ fn update_lamp_state(lamp_state: &mut LampState, command: Command) {
         }
         Command::Hsv(hue, sat, val) => {
             info!("Set lamp color to: hue={hue} sat={sat} val={val}");
-            lamp_state.color = hsv2rgb(Hsv { hue, sat, val });
+            lamp_state.color = hsv::hsv2rgb(hsv::Hsv { hue, sat, val });
         }
         Command::Rgb(red, green, blue) => {
             info!("Set lamp color to: red={red} green={green} blue={blue}");
