@@ -7,7 +7,8 @@ use dotenv_codegen::dotenv;
 use embassy_futures::select;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::{
-    modem::Modem, peripherals::Peripherals, rmt::config::TransmitConfig, rmt::TxRmtDriver, task,
+    cpu::Core, modem::Modem, peripherals::Peripherals, rmt::config::TransmitConfig,
+    rmt::TxRmtDriver, task,
 };
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::mqtt::client::{
@@ -73,11 +74,6 @@ fn main() {
     let peripherals = Peripherals::take().expect("Failed to take peripherals.");
     let led_pin = peripherals.pins.gpio19;
     let rmt_channel = peripherals.rmt.channel0;
-    let rmt_config = TransmitConfig::new().clock_divider(1).mem_block_num(8);
-    let rmt_driver =
-        TxRmtDriver::new(rmt_channel, led_pin, &rmt_config).expect("Failed to create RMT driver.");
-    let mut led_driver =
-        Ws2812Esp32Rmt::new_with_rmt_driver(rmt_driver).expect("Failed to create LED driver.");
 
     let touch_thresholds = match init_touch_sensor() {
         Ok(touch_thresholds) => Some(touch_thresholds),
@@ -90,6 +86,33 @@ fn main() {
         }
     };
 
+    let mut lamp_state = LampState::new();
+
+    let (mqtt_cmd_sender, touch_cmd_receiver) = mpsc::channel();
+    let (touch_cmd_sender, lamp_cmd_receiver) = mpsc::channel();
+
+    task::thread::ThreadSpawnConfiguration {
+        name: Some("LEDS\0".as_bytes()),
+        stack_size: 0x4000,
+        pin_to_core: Some(Core::Core1),
+        priority: 24,
+        ..Default::default()
+    }
+    .set()
+    .expect("Cannot set thread spawn config");
+
+    std::thread::spawn(move || -> ! {
+        let rmt_config = TransmitConfig::new().clock_divider(1).mem_block_num(8);
+        let rmt_driver = TxRmtDriver::new(rmt_channel, led_pin, &rmt_config)
+            .expect("Failed to create RMT driver.");
+        let mut led_driver =
+            Ws2812Esp32Rmt::new_with_rmt_driver(rmt_driver).expect("Failed to create LED driver.");
+        loop {
+            lamp_tick(&mut led_driver, &mut lamp_state, &lamp_cmd_receiver);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+
     task::block_on(async {
         let _wlan = connect_wlan(&sys_loop, &timer_service, &nvs, peripherals.modem)
             .await
@@ -97,11 +120,13 @@ fn main() {
 
         let (mut client, mut conn) = connect_mqtt().expect("Failed to connect to MQTT broker.");
 
-        run_mqtt_led_touch_loop(
+        run_mqtt_touch_loop(
             &mut client,
             &mut conn,
             &timer_service,
-            &mut led_driver,
+            &mqtt_cmd_sender,
+            &touch_cmd_receiver,
+            &touch_cmd_sender,
             touch_thresholds,
         )
         .await
@@ -195,82 +220,67 @@ impl TouchState {
     }
 }
 
-async fn run_mqtt_led_touch_loop(
+async fn run_mqtt_touch_loop(
     client: &mut EspAsyncMqttClient,
     connection: &mut EspAsyncMqttConnection,
     timer_service: &EspTimerService<Task>,
-    led_driver: &mut Ws2812Esp32Rmt<'_>,
+    mqtt_cmd_sender: &mpsc::Sender<Command>,
+    touch_cmd_receiver: &mpsc::Receiver<Command>,
+    touch_cmd_sender: &mpsc::Sender<Command>,
     touch_thresholds: Option<(u16, u16)>,
 ) -> Result<(), EspError> {
-    let mut lamp_state = LampState::new();
-    let mut touch_state = TouchState::new();
-
-    let (mqtt_cmd_sender, touch_cmd_receiver) = mpsc::channel();
-    let (touch_cmd_sender, lamp_cmd_receiver) = mpsc::channel();
-
     info!("About to start the MQTT connection.");
-
-    let mut lamp_timer = timer_service.timer_async()?;
+    let mut touch_state = TouchState::new();
     let mut touch_timer = timer_service.timer_async()?;
 
-    let res: select::Either3<Result<(), EspError>, Result<(), EspError>, Result<(), EspError>> =
-        select::select3(
-            pin::pin!(async move {
-                info!("Listening for MQTT messages.");
-                while let Ok(event) = connection.next().await {
-                    handle_mqtt_event(&event.payload(), &mqtt_cmd_sender);
-                }
-                info!("Connection closed");
-                Ok(())
-            }),
-            pin::pin!(async move {
-                for topic in [
-                    MQTT_TOPIC_MODE,
-                    MQTT_TOPIC_RGB,
-                    MQTT_TOPIC_HSV,
-                    MQTT_TOPIC_HEX,
-                    MQTT_TOPIC_WARM,
-                    MQTT_TOPIC_PROGRESS,
-                    MQTT_TOPIC_WHEEL_SPEED,
-                ]
-                .iter()
-                {
-                    loop {
-                        if let Err(e) = client.subscribe(topic, QoS::AtMostOnce).await {
-                            error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
-                            lamp_timer.after(Duration::from_millis(500)).await?;
-                            continue;
-                        }
-                        info!("Subscribed to topic \"{topic}\"");
-                        break;
+    let res: select::Either<Result<(), EspError>, Result<(), EspError>> = select::select(
+        pin::pin!(async move {
+            info!("Listening for MQTT messages.");
+            while let Ok(event) = connection.next().await {
+                handle_mqtt_event(&event.payload(), &mqtt_cmd_sender);
+            }
+            info!("Connection closed");
+            Ok(())
+        }),
+        pin::pin!(async move {
+            for topic in [
+                MQTT_TOPIC_MODE,
+                MQTT_TOPIC_RGB,
+                MQTT_TOPIC_HSV,
+                MQTT_TOPIC_HEX,
+                MQTT_TOPIC_WARM,
+                MQTT_TOPIC_PROGRESS,
+                MQTT_TOPIC_WHEEL_SPEED,
+            ]
+            .iter()
+            {
+                loop {
+                    if let Err(e) = client.subscribe(topic, QoS::AtMostOnce).await {
+                        error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
+                        touch_timer.after(Duration::from_millis(500)).await?;
+                        continue;
                     }
+                    info!("Subscribed to topic \"{topic}\"");
+                    break;
                 }
-
-                lamp_timer.after(Duration::from_millis(500)).await?;
-                loop {
-                    tube_lamp_tick(led_driver, &mut lamp_state, &lamp_cmd_receiver)?;
-                    lamp_timer.after(Duration::from_millis(10)).await?;
-                }
-            }),
-            pin::pin!(async move {
-                info!("Start touch sensor loop.");
-                loop {
-                    touch_sensor_tick(
-                        touch_thresholds,
-                        &mut touch_state,
-                        &touch_cmd_receiver,
-                        &touch_cmd_sender,
-                    );
-                    touch_timer.after(Duration::from_millis(10)).await?;
-                }
-            }),
-        )
-        .await;
+            }
+            info!("Start touch sensor loop.");
+            loop {
+                touch_sensor_tick(
+                    touch_thresholds,
+                    &mut touch_state,
+                    &touch_cmd_receiver,
+                    &touch_cmd_sender,
+                );
+                touch_timer.after(Duration::from_millis(10)).await?;
+            }
+        }),
+    )
+    .await;
 
     match res {
-        select::Either3::First(res) => res,
-        select::Either3::Second(res) => res,
-        select::Either3::Third(res) => res,
+        select::Either::First(res) => res,
+        select::Either::Second(res) => res,
     }
 }
 
@@ -477,11 +487,11 @@ fn touch_sensor_tick(
     }
 }
 
-fn tube_lamp_tick(
+fn lamp_tick(
     led_driver: &mut Ws2812Esp32Rmt,
     lamp_state: &mut LampState,
     cmd_receiver: &mpsc::Receiver<Command>,
-) -> Result<(), EspError> {
+) {
     debug!("Tube lamp tick");
 
     let led_driver_res = match lamp_state.mode {
@@ -521,7 +531,6 @@ fn tube_lamp_tick(
     }
 
     lamp_state.wheel_pos += lamp_state.wheel_speed;
-    Ok(())
 }
 
 fn update_lamp_state(lamp_state: &mut LampState, command: Command) {
