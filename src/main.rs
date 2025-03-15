@@ -24,8 +24,8 @@ use smart_leds::{hsv, RGB8};
 use smart_leds_trait::SmartLedsWrite;
 use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
-const SSID: &str = dotenv!("WLAN_SSID");
-const PASSWORD: &str = dotenv!("WLAN_PASSWORD");
+const WLAN_SSID: &str = dotenv!("WLAN_SSID");
+const WLAN_PASSWORD: &str = dotenv!("WLAN_PASSWORD");
 const MQTT_URL: &str = dotenv!("MQTT_URL");
 const MQTT_USERNAME: &str = dotenv!("MQTT_USERNAME");
 const MQTT_PASSWORD: &str = dotenv!("MQTT_PASSWORD");
@@ -39,7 +39,8 @@ const MQTT_TOPIC_WARM: &str = "lamps/tube/warm";
 const MQTT_TOPIC_PROGRESS: &str = "lamps/tube/progress";
 const MQTT_TOPIC_WHEEL_SPEED: &str = "lamps/tube/wheel_speed";
 
-const NUM_LEDS: usize = 54;
+const NUM_LEDS: usize = 86;
+
 static RAINBOW_COLORS: Lazy<[RGB8; NUM_LEDS]> = Lazy::new(|| {
     let mut rainbow_colors = [RGB8 { r: 0, g: 0, b: 0 }; NUM_LEDS];
     for (idx, color) in rainbow_colors.iter_mut().enumerate() {
@@ -512,14 +513,14 @@ fn lamp_tick(
         })),
         LampMode::Progress => led_driver.write((0..NUM_LEDS).map(|idx| {
             let hue: u8 = if idx < lamp_state.progress as usize * NUM_LEDS / u8::MAX as usize {
-                120
+                85
             } else {
                 0
             };
             let wave_idx = (NUM_LEDS - idx
                 + lamp_state.wheel_pos.0 as usize * NUM_LEDS / u16::MAX as usize)
                 % NUM_LEDS;
-            let sat: u8 = 255 - (60 * wave_idx / NUM_LEDS) as u8;
+            let sat: u8 = 255 - (40 * wave_idx / NUM_LEDS) as u8;
             hsv::hsv2rgb(hsv::Hsv { hue, sat, val: 255 })
         })),
     };
@@ -596,8 +597,8 @@ async fn connect_wlan(
     let mut wlan = AsyncWifi::wrap(&mut esp_wlan, sys_loop.clone(), timer_service.clone())?;
 
     wlan.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: SSID.try_into().unwrap(),
-        password: PASSWORD.try_into().unwrap(),
+        ssid: WLAN_SSID.try_into().unwrap(),
+        password: WLAN_PASSWORD.try_into().unwrap(),
         ..Default::default()
     }))?;
 
