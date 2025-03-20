@@ -75,7 +75,7 @@ fn main() {
     let nvs = EspDefaultNvsPartition::take().expect("Failed to take NVS partition.");
 
     let peripherals = Peripherals::take().expect("Failed to take peripherals.");
-    let led_pin = peripherals.pins.gpio19;
+    let led_strip_pin = peripherals.pins.gpio19;
     let rmt_channel = peripherals.rmt.channel0;
 
     let touch_thresholds = match init_touch_sensor() {
@@ -93,6 +93,7 @@ fn main() {
 
     let (mqtt_cmd_sender, touch_cmd_receiver) = mpsc::channel();
     let (touch_cmd_sender, lamp_cmd_receiver) = mpsc::channel();
+    touch_cmd_sender.send(Command::Blink).unwrap();
 
     task::thread::ThreadSpawnConfiguration {
         name: Some("LEDS\0".as_bytes()),
@@ -106,7 +107,7 @@ fn main() {
 
     std::thread::spawn(move || -> ! {
         let rmt_config = TransmitConfig::new().clock_divider(1).mem_block_num(8);
-        let rmt_driver = TxRmtDriver::new(rmt_channel, led_pin, &rmt_config)
+        let rmt_driver = TxRmtDriver::new(rmt_channel, led_strip_pin, &rmt_config)
             .expect("Failed to create RMT driver.");
         let mut led_driver =
             Ws2812Esp32Rmt::new_with_rmt_driver(rmt_driver).expect("Failed to create LED driver.");
@@ -181,6 +182,7 @@ enum Command {
     Warm(u8),
     Progress(u8),
     WheelSpeed(u16),
+    Blink,
 }
 
 #[derive(Debug)]
@@ -190,6 +192,7 @@ struct LampState {
     wheel_pos: Wrapping<u16>,
     wheel_speed: u16,
     progress: u8,
+    blink_count: u8,
 }
 
 impl LampState {
@@ -200,6 +203,7 @@ impl LampState {
             wheel_pos: Wrapping(0),
             wheel_speed: 300,
             progress: 0,
+            blink_count: 0,
         }
     }
 }
@@ -235,6 +239,7 @@ async fn run_mqtt_touch_loop(
     info!("About to start the MQTT connection.");
     let mut touch_state = TouchState::new();
     let mut touch_timer = timer_service.timer_async()?;
+    let blink_cmd_sender = mqtt_cmd_sender.clone();
 
     let res: select::Either<Result<(), EspError>, Result<(), EspError>> = select::select(
         pin::pin!(async move {
@@ -267,6 +272,7 @@ async fn run_mqtt_touch_loop(
                     break;
                 }
             }
+            blink_cmd_sender.send(Command::Blink).unwrap();
             info!("Start touch sensor loop.");
             loop {
                 touch_sensor_tick(
@@ -500,34 +506,47 @@ fn lamp_tick(
 ) {
     debug!("Tube lamp tick");
 
-    let led_driver_res = match lamp_state.mode {
-        LampMode::Off => led_driver.write(iter::repeat(RGB8 { r: 0, g: 0, b: 0 }).take(NUM_LEDS)),
-        LampMode::Color => led_driver.write(iter::repeat(lamp_state.color).take(NUM_LEDS)),
-        LampMode::Rainbow => led_driver.write(
-            iter::repeat(
-                RAINBOW_COLORS
-                    [lamp_state.wheel_pos.0 as usize * RAINBOW_COLORS.len() / u16::MAX as usize],
-            )
-            .take(NUM_LEDS),
-        ),
-        LampMode::Space => led_driver.write((0..RAINBOW_COLORS.len()).map(|idx| {
-            let space_idx = (idx
-                + (lamp_state.wheel_pos.0 as usize * RAINBOW_COLORS.len() / u16::MAX as usize))
-                % RAINBOW_COLORS.len();
-            RAINBOW_COLORS[space_idx]
-        })),
-        LampMode::Progress => led_driver.write((0..NUM_LEDS).map(|idx| {
-            let hue: u8 = if idx < lamp_state.progress as usize * NUM_LEDS / u8::MAX as usize {
-                85
-            } else {
-                0
-            };
-            let wave_idx = (NUM_LEDS - idx
-                + lamp_state.wheel_pos.0 as usize * NUM_LEDS / u16::MAX as usize)
-                % NUM_LEDS;
-            let sat: u8 = 255 - (40 * wave_idx / NUM_LEDS) as u8;
-            hsv::hsv2rgb(hsv::Hsv { hue, sat, val: 255 })
-        })),
+    let led_driver_res = if lamp_state.blink_count > 0 {
+        led_driver.write(
+            iter::repeat(RGB8 {
+                r: 10,
+                g: 10,
+                b: 10,
+            })
+            .take(1),
+        )
+    } else {
+        match lamp_state.mode {
+            LampMode::Off => {
+                led_driver.write(iter::repeat(RGB8 { r: 0, g: 0, b: 0 }).take(NUM_LEDS))
+            }
+            LampMode::Color => led_driver.write(iter::repeat(lamp_state.color).take(NUM_LEDS)),
+            LampMode::Rainbow => led_driver.write(
+                iter::repeat(
+                    RAINBOW_COLORS[lamp_state.wheel_pos.0 as usize * RAINBOW_COLORS.len()
+                        / u16::MAX as usize],
+                )
+                .take(NUM_LEDS),
+            ),
+            LampMode::Space => led_driver.write((0..RAINBOW_COLORS.len()).map(|idx| {
+                let space_idx = (idx
+                    + (lamp_state.wheel_pos.0 as usize * RAINBOW_COLORS.len() / u16::MAX as usize))
+                    % RAINBOW_COLORS.len();
+                RAINBOW_COLORS[space_idx]
+            })),
+            LampMode::Progress => led_driver.write((0..NUM_LEDS).map(|idx| {
+                let hue: u8 = if idx < lamp_state.progress as usize * NUM_LEDS / u8::MAX as usize {
+                    85
+                } else {
+                    0
+                };
+                let wave_idx = (NUM_LEDS - idx
+                    + lamp_state.wheel_pos.0 as usize * NUM_LEDS / u16::MAX as usize)
+                    % NUM_LEDS;
+                let sat: u8 = 255 - (10 * wave_idx / NUM_LEDS) as u8;
+                hsv::hsv2rgb(hsv::Hsv { hue, sat, val: 255 })
+            })),
+        }
     };
     led_driver_res.expect("Could not write to LED driver.");
 
@@ -537,6 +556,9 @@ fn lamp_tick(
     }
 
     lamp_state.wheel_pos += lamp_state.wheel_speed;
+    if lamp_state.blink_count > 0 {
+        lamp_state.blink_count -= 1;
+    }
 }
 
 fn update_lamp_state(lamp_state: &mut LampState, command: Command) {
@@ -568,6 +590,10 @@ fn update_lamp_state(lamp_state: &mut LampState, command: Command) {
         Command::WheelSpeed(wheel_speed) => {
             info!("Set wheel speed to: {wheel_speed}");
             lamp_state.wheel_speed = wheel_speed;
+        }
+        Command::Blink => {
+            info!("Trigger blink.");
+            lamp_state.blink_count = 40;
         }
     }
     if (lamp_state.mode == LampMode::Color) && (lamp_state.color == RGB8 { r: 0, g: 0, b: 0 }) {
