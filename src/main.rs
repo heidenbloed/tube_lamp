@@ -238,7 +238,7 @@ async fn run_mqtt_touch_loop(
         pin::pin!(async move {
             info!("Listening for MQTT messages.");
             while let Ok(event) = connection.next().await {
-                handle_mqtt_event(&event.payload(), &mqtt_cmd_sender);
+                handle_mqtt_event(&event.payload(), mqtt_cmd_sender);
             }
             info!("Connection closed");
             Ok(())
@@ -270,8 +270,8 @@ async fn run_mqtt_touch_loop(
                 touch_sensor_tick(
                     touch_thresholds,
                     &mut touch_state,
-                    &touch_cmd_receiver,
-                    &touch_cmd_sender,
+                    touch_cmd_receiver,
+                    touch_cmd_sender,
                 );
                 touch_timer.after(Duration::from_millis(10)).await?;
             }
