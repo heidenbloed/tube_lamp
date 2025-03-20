@@ -58,8 +58,8 @@ static WARM_COLORS: Lazy<[RGB8; u8::MAX as usize + 1]> = Lazy::new(|| {
     let mut warm_colors = [RGB8 { r: 0, g: 0, b: 0 }; u8::MAX as usize + 1];
     for (idx, color) in warm_colors.iter_mut().enumerate() {
         *color = hsv::hsv2rgb(hsv::Hsv {
-            hue: 10,
-            sat: 230,
+            hue: 15,
+            sat: 245,
             val: idx as u8,
         });
     }
