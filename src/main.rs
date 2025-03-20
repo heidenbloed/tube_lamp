@@ -1,7 +1,8 @@
 use std::num::Wrapping;
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Duration;
-use std::{iter, pin, str, str::FromStr};
+use std::{iter, pin, str};
 
 use dotenv_codegen::dotenv;
 use embassy_futures::select;
@@ -40,6 +41,7 @@ const MQTT_TOPIC_PROGRESS: &str = "lamps/tube/progress";
 const MQTT_TOPIC_WHEEL_SPEED: &str = "lamps/tube/wheel_speed";
 
 const NUM_LEDS: usize = 86;
+const TOUCH_BRIGHTNESS_LEVELS: u8 = 4;
 
 static RAINBOW_COLORS: Lazy<[RGB8; NUM_LEDS]> = Lazy::new(|| {
     let mut rainbow_colors = [RGB8 { r: 0, g: 0, b: 0 }; NUM_LEDS];
@@ -194,7 +196,7 @@ impl LampState {
     fn new() -> Self {
         Self {
             mode: LampMode::Off,
-            color: WARM_COLORS[(u8::MAX / 5) as usize],
+            color: WARM_COLORS[u8::MAX.div_ceil(TOUCH_BRIGHTNESS_LEVELS) as usize],
             wheel_pos: Wrapping(0),
             wheel_speed: 300,
             progress: 0,
@@ -216,7 +218,7 @@ impl TouchState {
             is_touched_mode: false,
             is_touched_bright: false,
             current_lamp_mode: LampMode::Off,
-            current_warm_brightness: u8::MAX / 5,
+            current_warm_brightness: u8::MAX.div_ceil(TOUCH_BRIGHTNESS_LEVELS),
         }
     }
 }
@@ -453,11 +455,14 @@ fn touch_sensor_tick(
                         {
                             0
                         } else if touch_state.current_warm_brightness
-                            > (u8::MAX as u16 * 4 / 5) as u8
+                            > (u8::MAX as u16 * (TOUCH_BRIGHTNESS_LEVELS - 1) as u16
+                                / TOUCH_BRIGHTNESS_LEVELS as u16)
+                                as u8
                         {
                             u8::MAX
                         } else {
-                            touch_state.current_warm_brightness + u8::MAX / 5
+                            touch_state.current_warm_brightness
+                                + u8::MAX.div_ceil(TOUCH_BRIGHTNESS_LEVELS)
                         };
                         touch_state.current_lamp_mode = LampMode::Color;
                         touch_state.current_warm_brightness = new_warm_brightness;
@@ -567,7 +572,7 @@ fn update_lamp_state(lamp_state: &mut LampState, command: Command) {
     }
     if (lamp_state.mode == LampMode::Color) && (lamp_state.color == RGB8 { r: 0, g: 0, b: 0 }) {
         lamp_state.mode = LampMode::Off;
-        lamp_state.color = WARM_COLORS[(u8::MAX / 5) as usize];
+        lamp_state.color = WARM_COLORS[u8::MAX.div_ceil(TOUCH_BRIGHTNESS_LEVELS) as usize];
     }
     info!("New lamp state: {lamp_state:?}");
 }
