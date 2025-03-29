@@ -42,6 +42,7 @@ const MQTT_TOPIC_WHEEL_SPEED: &str = "lamps/tube/wheel_speed";
 
 const NUM_LEDS: usize = 86;
 const TOUCH_BRIGHTNESS_LEVELS: u8 = 4;
+const BLINK_LENGTH: u8 = 40;
 
 static RAINBOW_COLORS: Lazy<[RGB8; NUM_LEDS]> = Lazy::new(|| {
     let mut rainbow_colors = [RGB8 { r: 0, g: 0, b: 0 }; NUM_LEDS];
@@ -144,6 +145,7 @@ enum LampMode {
     Color,
     Rainbow,
     Space,
+    Police,
     Progress,
 }
 
@@ -156,6 +158,7 @@ impl FromStr for LampMode {
             "color" => Ok(LampMode::Color),
             "rainbow" => Ok(LampMode::Rainbow),
             "space" => Ok(LampMode::Space),
+            "police" => Ok(LampMode::Police),
             "progress" => Ok(LampMode::Progress),
             _ => Err(()),
         }
@@ -168,7 +171,8 @@ impl LampMode {
             LampMode::Off => LampMode::Color,
             LampMode::Color => LampMode::Rainbow,
             LampMode::Rainbow => LampMode::Space,
-            LampMode::Space => LampMode::Off,
+            LampMode::Space => LampMode::Police,
+            LampMode::Police => LampMode::Off,
             LampMode::Progress => LampMode::Off,
         }
     }
@@ -534,6 +538,14 @@ fn lamp_tick(
                     % RAINBOW_COLORS.len();
                 RAINBOW_COLORS[space_idx]
             })),
+            LampMode::Police => led_driver.write((0..NUM_LEDS).map(|idx| {
+                let red_first = (lamp_state.wheel_pos.0 % (u16::MAX / 2)) < u16::MAX / 4;
+                if (red_first && idx < NUM_LEDS / 2) || (!red_first && idx >= NUM_LEDS / 2) {
+                    RGB8 { r: 255, g: 0, b: 0 }
+                } else {
+                    RGB8 { r: 0, g: 0, b: 255 }
+                }
+            })),
             LampMode::Progress => led_driver.write((0..NUM_LEDS).map(|idx| {
                 let hue: u8 = if idx < lamp_state.progress as usize * NUM_LEDS / u8::MAX as usize {
                     85
@@ -593,7 +605,7 @@ fn update_lamp_state(lamp_state: &mut LampState, command: Command) {
         }
         Command::Blink => {
             info!("Trigger blink.");
-            lamp_state.blink_count = 40;
+            lamp_state.blink_count = BLINK_LENGTH;
         }
     }
     if (lamp_state.mode == LampMode::Color) && (lamp_state.color == RGB8 { r: 0, g: 0, b: 0 }) {
