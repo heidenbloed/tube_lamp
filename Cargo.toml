@@ -1,0 +1,42 @@
+[package]
+authors = ["heidenbloed <69988488+heidenbloed@users.noreply.github.com>"]
+edition = "2021"
+name = "tube_lamp"
+resolver = "2"
+rust-version = "1.77"
+version = "0.1.0"
+
+[[bin]]
+harness = false
+name = "tube_lamp"
+
+[profile.release]
+opt-level = "s"
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[features]
+default = []
+experimental = ["esp-idf-svc/experimental"]
+
+[dependencies]
+dotenv_codegen = "0.15.0"
+embassy-futures = "0.1.1"
+esp-idf-hal = "0.45.2"
+esp-idf-sys = "0.36.1"
+log = "0.4"
+once_cell = "1.20.3"
+smart-leds = "0.3.0"
+smart-leds-trait = "0.3.1"
+
+[dependencies.ws2812-esp32-rmt-driver]
+features = ["smart-leds-trait"]
+version = "0.12.0"
+
+[dependencies.esp-idf-svc]
+features = ["critical-section", "embassy-sync", "embassy-time-driver"]
+version = "0.51"
+
+[build-dependencies]
+embuild = "0.33"

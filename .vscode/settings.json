@@ -1,0 +1,16 @@
+{
+    "editor.formatOnSave": true,
+    "evenBetterToml.taplo.configFile.path": ".taplo.toml",
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.rulers": [
+            100
+        ]
+    },
+    "[toml]": {
+        "editor.defaultFormatter": "tamasfe.even-better-toml",
+        "editor.rulers": [
+            80
+        ]
+    }
+}
